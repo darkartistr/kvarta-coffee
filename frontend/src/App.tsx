@@ -66,8 +66,10 @@ export default function App() {
         <Catalog onSelectProduct={handleSelectProduct} />
         <DeliverySection />
         <OrderForm 
-          initialInterest={selectedInterest} 
-          initialComment={selectedComment} 
+          interest={selectedInterest}
+          comment={selectedComment}
+          onInterestChange={setSelectedInterest}
+          onCommentChange={setSelectedComment}
         />
       </main>
 

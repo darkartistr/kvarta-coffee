@@ -13,28 +13,37 @@ import {
 } from 'lucide-react';
 import { formatBelarusianPhone, validateBelarusianPhone, cleanPhoneNumber } from '../utils/phone';
 import { getUtmParameters } from '../utils/utm';
-import { OrderFormData, UtmParams } from '../types/coffee';
+import { OrderFormData } from '../types/coffee';
 
 interface OrderFormProps {
-  initialInterest?: string;
-  initialComment?: string;
+  interest: string;
+  comment: string;
+  onInterestChange: (interest: string) => void;
+  onCommentChange: (comment: string) => void;
 }
 
 const STORAGE_KEY_PREFIX = 'kvarta_phone_lock_';
 const LOCK_DURATION_MS = 10 * 60 * 1000; // 10 minutes
+const API_BASE_URL = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+
+interface LeadApiResponse {
+  success?: boolean;
+  message?: string;
+  lead_id?: number;
+  detail?: string | Array<{ msg?: string }>;
+}
 
 export const OrderForm: React.FC<OrderFormProps> = ({ 
-  initialInterest = 'single_order', 
-  initialComment = '' 
+  interest,
+  comment,
+  onInterestChange,
+  onCommentChange,
 }) => {
   const formId = useId();
 
   // Form state
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('+375 ');
-  const [interest, setInterest] = useState<string>(initialInterest);
-  const [comment, setComment] = useState(initialComment);
-  const [utmParams, setUtmParams] = useState<UtmParams>({});
 
   // UI & UX states
   const [phoneError, setPhoneError] = useState<string | null>(null);
@@ -47,22 +56,6 @@ export const OrderForm: React.FC<OrderFormProps> = ({
   // Duplicate protection state (10 minutes lock)
   const [lockedUntil, setLockedUntil] = useState<number | null>(null);
   const [remainingSeconds, setRemainingSeconds] = useState<number>(0);
-
-  // Sync initial props if catalog item is picked
-  useEffect(() => {
-    if (initialInterest) {
-      setInterest(initialInterest);
-    }
-    if (initialComment) {
-      setComment(initialComment);
-    }
-  }, [initialInterest, initialComment]);
-
-  // Load UTM tags on mount
-  useEffect(() => {
-    const utm = getUtmParameters();
-    setUtmParams(utm);
-  }, []);
 
   // Check phone lock whenever phone changes or countdown ticks
   const checkPhoneLock = (phoneNumber: string) => {
@@ -167,39 +160,66 @@ export const OrderForm: React.FC<OrderFormProps> = ({
     setSubmitError(null);
 
     // Prepare payload with marketing tags
+    const currentUtmParams = getUtmParameters();
     const payload: OrderFormData = {
       name: name.trim(),
       phone: phone.trim(),
       interest,
       comment: comment.trim(),
-      utm: utmParams,
+      utm: currentUtmParams,
     };
 
     try {
-      // Simulate real transmission & duplicate prevention record
-      await new Promise((resolve) => setTimeout(resolve, 800));
-
-      // Lock this phone number for 10 minutes in localStorage
-      const now = Date.now();
-      localStorage.setItem(`${STORAGE_KEY_PREFIX}${digits}`, now.toString());
-
-      // Save submission to client log for transparency
-      const submissionHistory = JSON.parse(localStorage.getItem('kvarta_submissions_history') || '[]');
-      submissionHistory.push({
-        ...payload,
-        timestamp: now,
-        id: `KV-${Math.floor(1000 + Math.random() * 9000)}`,
+      const response = await fetch(`${API_BASE_URL}/api/lead`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...payload,
+          ...currentUtmParams,
+          page_url: window.location.href,
+        }),
       });
-      localStorage.setItem('kvarta_submissions_history', JSON.stringify(submissionHistory));
+      const result = (await response.json().catch(() => ({}))) as LeadApiResponse;
 
-      const newOrderNumber = `KV-${Math.floor(1000 + Math.random() * 9000)}`;
+      if (!response.ok) {
+        const detail = result.detail;
+        const errorMessage = Array.isArray(detail)
+          ? detail.map((item) => item.msg).filter(Boolean).join('. ')
+          : detail;
+        throw new Error(
+          errorMessage || 'Не удалось отправить заявку. Попробуйте ещё раз или позвоните нам.',
+        );
+      }
+
+      const now = Date.now();
+      try {
+        localStorage.setItem(`${STORAGE_KEY_PREFIX}${digits}`, now.toString());
+        const storedHistory = JSON.parse(localStorage.getItem('kvarta_submissions_history') || '[]');
+        const submissionHistory = Array.isArray(storedHistory) ? storedHistory : [];
+        submissionHistory.push({
+          ...payload,
+          timestamp: now,
+          id: result.lead_id ? `KV-${result.lead_id}` : `KV-${Math.floor(1000 + Math.random() * 9000)}`,
+        });
+        localStorage.setItem('kvarta_submissions_history', JSON.stringify(submissionHistory));
+      } catch {
+        // The server accepted the lead; browser storage is only a convenience.
+      }
+
+      const newOrderNumber = result.lead_id
+        ? `KV-${result.lead_id}`
+        : `KV-${Math.floor(1000 + Math.random() * 9000)}`;
       setOrderNumber(newOrderNumber);
       setSubmitSuccess(payload);
       setLockedUntil(now + LOCK_DURATION_MS);
       setRemainingSeconds(600);
-    } catch {
+    } catch (error) {
       setSubmitError(
-        'Не удалось отправить заявку из-за временного сбоя сети. Пожалуйста, свяжитесь с нами напрямую по телефону или в Telegram.'
+        error instanceof TypeError
+          ? 'Не удалось связаться с сервером. Проверьте, что бэкенд запущен, и попробуйте ещё раз.'
+          : error instanceof Error
+          ? error.message
+          : 'Не удалось отправить заявку. Попробуйте ещё раз или позвоните нам.',
       );
     } finally {
       setIsSubmitting(false);
@@ -259,7 +279,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                 </h3>
                 <p className="text-sm sm:text-base text-[#cbbdb2] max-w-lg mx-auto leading-relaxed">
                   Мы получили ваш запрос на номер <strong className="text-[#fbf6f0] font-mono">{submitSuccess.phone}</strong>. 
-                  Менеджер перезвонит вам в ближайшее время, чтобы уточнить помол и детали доставки.
+                  Спасибо! Ваша заявка принята, менеджер скоро перезвонит, чтобы уточнить помол и детали доставки.
                 </p>
               </div>
 
@@ -290,7 +310,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                 <button
                   onClick={() => {
                     setSubmitSuccess(null);
-                    setComment('');
+                    onCommentChange('');
                   }}
                   className="px-5 py-2.5 text-xs font-medium text-[#cbbdb2] hover:text-[#fbf6f0] bg-[#241811] hover:bg-[#322117] rounded border border-[#3b281c] transition-colors cursor-pointer"
                 >
@@ -310,14 +330,6 @@ export const OrderForm: React.FC<OrderFormProps> = ({
             /* Order Submission Form */
             <form onSubmit={handleSubmit} className="space-y-6">
               
-              {/* Hidden UTM Marketing Inputs */}
-              <input type="hidden" name="utm_source" value={utmParams.utm_source || ''} />
-              <input type="hidden" name="utm_medium" value={utmParams.utm_medium || ''} />
-              <input type="hidden" name="utm_campaign" value={utmParams.utm_campaign || ''} />
-              <input type="hidden" name="utm_content" value={utmParams.utm_content || ''} />
-              <input type="hidden" name="utm_term" value={utmParams.utm_term || ''} />
-              <input type="hidden" name="referrer" value={utmParams.referrer || ''} />
-
               {/* Duplicate Protection Warning if locked */}
               {lockedUntil && (
                 <div className="p-4 rounded-lg bg-amber-950/40 border border-amber-600/40 text-amber-200 text-xs sm:text-sm flex items-start gap-3">
@@ -465,7 +477,7 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                   <select
                     id={`${formId}-interest`}
                     value={interest}
-                    onChange={(e) => setInterest(e.target.value)}
+                    onChange={(e) => onInterestChange(e.target.value)}
                     className="w-full px-4 py-3 bg-[#130d0a] border border-[#3b281c] rounded-md text-sm text-[#fbf6f0] appearance-none focus:outline-none focus:border-[#d49b6a] focus:ring-1 focus:ring-[#d49b6a] transition-colors pr-10 cursor-pointer"
                   >
                     {interestOptions.map((opt) => (
@@ -491,20 +503,10 @@ export const OrderForm: React.FC<OrderFormProps> = ({
                   rows={3}
                   placeholder="Например: 2 пачки Колумбии, смолоть под гейзерную кофеварку. Доставка в пятницу после 18:00."
                   value={comment}
-                  onChange={(e) => setComment(e.target.value)}
+                  onChange={(e) => onCommentChange(e.target.value)}
                   className="w-full px-4 py-3 bg-[#130d0a] border border-[#3b281c] rounded-md text-sm text-[#fbf6f0] placeholder:text-[#5a4233] focus:outline-none focus:border-[#d49b6a] focus:ring-1 focus:ring-[#d49b6a] transition-colors"
                 />
               </div>
-
-              {/* Marketing tags transparency note */}
-              {Object.keys(utmParams).length > 0 && (
-                <div className="text-[11px] text-[#7a675a] font-mono border-t border-[#251812] pt-3 flex items-center flex-wrap gap-2">
-                  <span>Рекламный источник:</span>
-                  {utmParams.utm_source && <span className="text-[#a89688]">source: {utmParams.utm_source}</span>}
-                  {utmParams.utm_medium && <span className="text-[#a89688]">medium: {utmParams.utm_medium}</span>}
-                  {utmParams.utm_campaign && <span className="text-[#a89688]">campaign: {utmParams.utm_campaign}</span>}
-                </div>
-              )}
 
               {/* Submit Button with Anti-Double-Click and Lockout Check */}
               <div className="pt-2">
